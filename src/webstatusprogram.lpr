@@ -7,8 +7,8 @@ uses
  {$ifdef CONTROLLER_RPI3}                BCM2837,BCM2710,PlatformRPi3,                {$endif}
  {$ifdef CONTROLLER_QEMUVPB}             QEMUVersatilePB,PlatformQemuVpb,VersatilePB, {$endif}
 
- Classes,Crt,GlobalConfig,GlobalConst,
- HTTP,Ip,Logging,Mouse,Network,Platform,Serial,
+ Classes,Console,GlobalConfig,GlobalConst,GlobalTypes,
+ HeapManager,HTTP,Ip,Logging,Mouse,Network,Platform,Rtc,Serial,
  StrUtils,SysUtils,Ultibo,WebStatus,Winsock2;
 
 type
@@ -36,9 +36,16 @@ begin
 end;
 
 procedure Log(S:String);
+var
+ X,Y:Cardinal;
 begin
  LoggingOutput(S);
  WriteLn(S);
+ X:=ConsoleWhereX;
+ Y:=ConsoleWhereY;
+ ConsoleGotoXY(1,6);
+ ConsoleClrEol;
+ ConsoleGotoXY(X,Y);
 end;
 
 procedure StartLogging;
@@ -74,10 +81,82 @@ begin
   raise Exception.Create('Exception - unassigned pointer');
 end;
 
+const
+ HEAP_FLAG_SYSTEM_RESET_HISTORY=$08000000;
+
+type
+ PPersistentStorage = ^TPersistentStorage;
+ TPersistentStorage = packed record
+  ReservedForHeapManager:array[0..31] of Byte;
+  Signature:LongWord;
+  ResetCount:LongWord;
+  ClockCountAtLastReset:LongWord;
+  ClockCountForColdStart:LongWord;
+  StartingClockCount:LongWord;
+ end;
+
+ TSystemResetHistory = record
+  Valid:Boolean;
+  Storage:PPersistentStorage;
+  constructor Create(Where:Pointer);
+  function GetResetCount:LongWord;
+  function SecondsSinceLastReset:Double;
+  procedure SetClockCountAtLastReset(Count:LongWord);
+ end;
+
 var
  IpAddress:String;
  EffectiveIpAddress:String;
  HTTPListener:THTTPListener;
+
+constructor TSystemResetHistory.Create(Where:Pointer);
+const
+ InitializationSignature=$73AF72EC;
+begin
+ Storage:=PPersistentStorage(RequestHeapBlock(Where,1*1024*1024,HEAP_FLAG_SYSTEM_RESET_HISTORY,CPU_AFFINITY_NONE));
+ Valid:=Storage = Where;
+ if Valid then
+  begin
+   Storage.StartingClockCount:=ClockGetCount;
+   if Storage.Signature <> InitializationSignature then
+    begin
+     Storage.Signature:=InitializationSignature;
+     Storage.ResetCount:=0;
+     Storage.ClockCountAtLastReset:=0;
+     Storage.ClockCountForColdStart:=Storage.StartingClockCount;
+    end
+   else
+    begin
+     Inc(Storage.ResetCount);
+    end;
+  end;
+end;
+
+function TSystemResetHistory.GetResetCount:LongWord;
+begin
+ if Valid then
+  Result:=Storage.ResetCount
+ else
+  Result:=0;
+end;
+
+function TSystemResetHistory.SecondsSinceLastReset:Double;
+begin
+ if Valid then
+  begin
+   Result:=(ClockGetCount - Storage.ClockCountAtLastReset) / (1000*1000);
+  end
+ else
+  begin
+   Result:=0;
+  end;
+end;
+
+procedure TSystemResetHistory.SetClockCountAtLastReset(Count:LongWord);
+begin
+ if Valid then
+  Storage.ClockCountAtLastReset:=Count;
+end;
 
 function GetIpAddress:String;
 var
@@ -106,6 +185,7 @@ var
  I,Start:Cardinal;
  Param:String;
 begin
+ Log(Format('Command Line = <%s>',[GetCommandLine]));
  for I:=0 to ParamCount do
   begin
    Param:=ParamStr(I);
@@ -114,19 +194,16 @@ begin
     begin
      Start:=PosEx('=',Param);
      BuildNumber:=StrToInt(MidStr(Param,Start + 1,Length(Param) - Start));
-     Log(Format('Build Number %d',[BuildNumber]));
     end;
    if AnsiStartsStr('qemuhostip=',Param) then
     begin
      Start:=PosEx('=',Param);
      QemuHostIpAddress:=MidStr(Param,Start + 1,Length(Param) - Start);
-     Log(Format('QEMU Host IP %s',[QemuHostIpAddress]));
     end;
    if AnsiStartsStr('qemuhostportdigit=',Param) then
     begin
      Start:=PosEx('=',Param);
      QemuHostIpPortDigit:=MidStr(Param,Start + 1,Length(Param) - Start);
-     Log(Format('QEMU Host IP Port Digit %s',[QemuHostIpPortDigit]));
     end;
   end;
 end;
@@ -139,8 +216,7 @@ type
 function TWebAboutStatus.DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean; 
 begin
  Log('TWebAboutStatus.DoContent');
- AddItem(AResponse,'QEMU vnc server',Format('host %s port 597%s',[EffectiveIpAddress,QemuHostIpPortDigit]));
- AddItem(AResponse,'Web Browser vncviewer',MakeLink(Format('use host %s port 577%s - note port 577%s, not 597%s',[EffectiveIpAddress,QemuHostIpPortDigit,QemuHostIpPortDigit,QemuHostIpPortDigit]),'http://novnc.com/noVNC/vnc.html'));
+ AddItem(AResponse,'QEMU vnc server',Format('Connect vnc viewer to host %s port 597%s or ',[EffectiveIpAddress,QemuHostIpPortDigit]) + MakeLink('use web browser',Format('http://novnc.com/noVNC/vnc_auto.html?host=%s&port=577%s&reconnect=1&reconnect_delay=5000',[EffectiveIpAddress,QemuHostIpPortDigit])));
  AddItem(AResponse,'CircleCI Build:',MakeLink(Format('Build #%d markfirmware/ultibo-webstatus (branch test-20170425)',[BuildNumber]),Format('https://circleci.com/gh/markfirmware/ultibo-webstatus/%d#artifacts/containers/0',[BuildNumber])));
  AddItem(AResponse,'GitHub Source:',MakeLink('markfirmware/ultibo-webstatus (branch test-20170425)','https://github.com/markfirmware/ultibo-webstatus/tree/test-20170425'));
  Result:=True;
@@ -150,37 +226,25 @@ var
  AboutStatus:TWebAboutStatus;
 
 procedure StartHttpServer;
+var
+ HTTPClient:THTTPClient;
+ ResponseBody:String;
 begin
  HTTPListener:=THTTPListener.Create;
  WebStatusRegister(HTTPListener,'','',True);
  AboutStatus:=TWebAboutStatus.Create('About','/about',2);
  HTTPListener.RegisterDocument('',AboutStatus);
  HTTPListener.Active:=True;
+ HTTPClient:=THTTPClient.Create;
+ if not HTTPClient.GetString('http://127.0.0.1/status/about',ResponseBody) then
+  Log(Format('HTTPClient error %d %s',[HTTPClient.ResponseStatus,HTTPClient.ResponseReason]))
 end;
 
-procedure SystemReset;
-{$ifdef CONTROLLER_QEMUVPB}
 var
- SysResetRegister:LongWord;
-{$endif} 
-begin
- {$ifdef CONTROLLER_QEMUVPB}
-  Log('');
-  Log('system reset requested');
-  GotoXY(20,1);
-  Write('System reset requested - will take no more than 3 seconds                                ');
-  Sleep(1 * 1000);
-  PLongWord(VERSATILEPB_SYS_LOCK)^:=$a05f;
-  SysResetRegister:=PLongWord(VERSATILEPB_SYS_LOCK)^;
-  SysResetRegister:=SysResetRegister or $105;
-  PLongWord(VERSATILEPB_SYS_RESETCTL)^:=SysResetRegister;
-  PLongWord(VERSATILEPB_SYS_LOCK)^:=$0;
- {$endif} 
-end;
+ Window:TWindowHandle;
 
 type
  TRateMeter = class
-  Active:Boolean;
   Count:Cardinal;
   FirstClock:Int64;
   LastClock:Int64;
@@ -201,80 +265,106 @@ begin
  Reset;
 end;
 
-function TRateMeter.GetCount:Cardinal;
-begin
- Result:=Count;
-end;
-
 procedure TRateMeter.Reset;
 begin
- Active:=False;
-end;
-
-procedure TRateMeter.FlushInSeconds(Time:Double);
-begin
- if ClockGetTotal - LastClock >= 1000 * 1000 * Time then
-  Active:=False;
+ Count:=0;
+ FirstClock:=ClockGetTotal;
+ LastClock:=FirstClock;
 end;
 
 procedure TRateMeter.Increment;
 begin
- if not Active then
-  begin
-   Count:=1;
-   Active:=True;
-   FirstClock:=ClockGetTotal;
-   LastClock:=FirstClock;
-  end
- else
-  begin
-   Inc(Count);
-   LastClock:=ClockGetTotal;
-  end;
+ Inc(Count);
+ LastClock:=ClockGetTotal;
 end;
 
 function TRateMeter.RateInHz:Double;
 var
  Delta:Double;
 begin
- if Active and (Count >= 3) and (LastClock <> FirstClock) then
+ Delta:=LastClock;
+ Delta:=Delta - FirstClock;
+ if Delta >= 500 * 1000 then
   begin
-   Delta:=LastClock;
-   Delta:=Delta - FirstClock;
    Result:=1000.0 * 1000.0 * Count / Delta;
   end
  else
   Result:=0;
 end;
 
+procedure TRateMeter.FlushInSeconds(Time:Double);
+begin
+ if ClockGetTotal - LastClock >= 1000 * 1000 * Time then
+  Reset;
+end;
+
+function TRateMeter.GetCount:Cardinal;
+begin
+ Result:=Count;
+end;
+
+var
+ SystemResetHistory:TSystemResetHistory;
+
+procedure SystemReset;
+{$ifdef CONTROLLER_QEMUVPB}
+var
+ SysResetRegister:LongWord;
+{$endif} 
+begin
+ {$ifdef CONTROLLER_QEMUVPB}
+  ConsoleWindowSetBackColor(Window,COLOR_YELLOW);
+  ConsoleClrScr;
+  Log('');
+  Log('system reset initiated');
+  Sleep(1 * 1000);
+  Log('this can take up to 5 seconds ...');
+  SystemResetHistory.SetClockCountAtLastReset(ClockGetCount);
+  PLongWord(VERSATILEPB_SYS_LOCK)^:=$a05f;
+  SysResetRegister:=PLongWord(VERSATILEPB_SYS_RESETCTL)^;
+  SysResetRegister:=SysResetRegister or $105;
+  PLongWord(VERSATILEPB_SYS_RESETCTL)^:=SysResetRegister;
+  PLongWord(VERSATILEPB_SYS_LOCK)^:=$0;
+ {$endif} 
+end;
+
 procedure Main;
 var
  MouseData:TMouseData;
  MouseCount:Cardinal;
- MouseOffsetX,MouseOffsetY:Integer;
- X,Y:Cardinal;
+ MouseButtons:Word;
+ MouseOffsetX,MouseOffsetY,MouseOffsetWheel:Integer;
+ I,X,Y:Cardinal;
  Key:Char;
+ CapturedClockGetTotal,CapturedClockSeconds,CapturedSysRtcGetTime:Int64;
+ AdjustedRtc,RtcAdjustment:Int64;
 begin
+ SystemResetHistory:=TSystemResetHistory.Create(Pointer((64 - 1) * 1024*1024));
+ Window:=ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_FULL,True);
+ ConsoleWindowSetBackColor(Window,COLOR_WHITE);
+ RtcAdjustment:=SysRtcGetTime - ClockGetTotal * 10;
  BuildNumber:=0;
  FrameMeter:=TRateMeter.Create;
  MouseMeter:=TRateMeter.Create;
  MouseOffsetX:=0;
  MouseOffsetY:=0;
+ MouseOffsetWheel:=0;
+ MouseButtons:=0;
  QemuHostIpAddress:='';
  DetermineEntryState;
  StartLogging;
  Sleep(500);
- Log('');
+ for I:=1 to 6 do
+  Log ('');
  Log('program start');
+ Log(Format('Reset count %d Time since last reset %5.3f seconds',[SystemResetHistory.GetResetCount,SystemResetHistory.SecondsSinceLastReset]));
  ParseCommandLine;
  Log(Format('Ultibo Release %s %s %s',[ULTIBO_RELEASE_DATE,ULTIBO_RELEASE_NAME,ULTIBO_RELEASE_VERSION]));
- Log(Format('BoardType %s',[BoardTypeToString(BoardGetType)]));
- Log(ControllerToString(Controller));
  if Controller = QemuVpb then
   begin
    EffectiveIpAddress:=QemuHostIpAddress;
    Log('');
-   Log(Format('Web Server Effective URL (running under QEMU) is http://%s:8%s',[EffectiveIpAddress,QemuHostIpPortDigit]));
+   Log(Format('Web Server Effective URL (running under QEMU) is http://%s:557%s',[EffectiveIpAddress,QemuHostIpPortDigit]));
   end
  else
   begin
@@ -289,14 +379,22 @@ begin
  if InService then
   while True do
    begin
+    CapturedSysRtcGetTime:=SysRtcGetTime;
+    CapturedClockGetTotal:=ClockGetTotal;
+    CapturedClockSeconds:=ClockSeconds;
+    AdjustedRtc:=(CapturedSysRtcGetTime - RtcAdjustment) div (10*1000*1000) * (10*1000*1000);
     FrameMeter.Increment;
-    if KeyPressed then
+    if ConsoleKeyPressed then
      begin
-      Key:=ReadKey;
-      WriteLn(Format('KeyPressed %s',[Key]));
+      Key:=ConsoleReadKey;
+      Log(Format('KeyPressed <%s> %d',[Key,Ord(Key)]));
       if Key = 'r' then
        begin
         SystemReset;
+       end;
+      if Ord(Key) = 163 then
+       begin
+        Log('power reset initiated');
        end;
      end;
     while True do
@@ -308,18 +406,39 @@ begin
         MouseMeter.Increment;
         MouseOffsetX:=MouseData.OffsetX;
         MouseOffsetY:=MouseData.OffsetY;
+        MouseOffsetWheel:=MouseData.OffsetWheel;
+        MouseButtons:=MouseData.Buttons;
        end
       else
        begin
         MouseMeter.FlushInSeconds(0.3);
+        if MouseMeter.GetCount = 0 then
+         begin
+          MouseOffsetX:=0;
+          MouseOffsetY:=0;
+          MouseOffsetWheel:=0;
+         end;
         break;
        end;
      end;
-    X:=WhereX;
-    Y:=WhereY;
-    GotoXY(20,1);
-    Write(Format('Frame Count %3d Rate %5.1f Hz Mouse rate %5.1f Hz x %d y %d      ',[FrameMeter.GetCount,FrameMeter.RateInHz,MouseMeter.RateInHz,MouseOffsetX,MouseOffsetY]));
-    GotoXY(X,Y);
+    X:=ConsoleWhereX;
+    Y:=ConsoleWhereY;
+    ConsoleGotoXY(20,1);
+    Write(Format('   Frame Count %3d Rate %5.1f Hz',[FrameMeter.GetCount,FrameMeter.RateInHz]));
+    ConsoleClrEol;
+    ConsoleGotoXY(20,2);
+    Write(Format('   Mouse Count %3d Rate %5.1f Hz dx %4d dy %4d dw %d Buttons %4.4x',[MouseMeter.Count,MouseMeter.RateInHz,MouseOffsetX,MouseOffsetY,MouseOffsetWheel,MouseButtons]));
+    ConsoleClrEol;
+    ConsoleGotoXY(20,3);
+    Write(Format('   Clock %8d RTC (adjusted) %9d',[CapturedClockGetTotal,AdjustedRtc]));
+    ConsoleClrEol;
+    ConsoleGotoXY(20,4);
+    Write(Format('   ClockSeconds %d Error %d',[CapturedClockSeconds, CapturedClockGetTotal div (1000*1000) - CapturedClockSeconds]));
+    ConsoleClrEol;
+    ConsoleGotoXY(20,5);
+    Write(Format('   ',[]));
+    ConsoleClrEol;
+    ConsoleGotoXY(X,Y);
    end;
 end;
 
